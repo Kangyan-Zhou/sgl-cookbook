@@ -25,9 +25,8 @@ import {
 } from "./types";
 
 // Path to model YAML files (generated from src/)
-// Version is now a top-level folder, default to v0.5.6
-const VERSION = process.env.SGLANG_VERSION || "v0.5.6";
-const MODELS_DIR = path.join(__dirname, "..", "models", "generated", VERSION);
+// Version filtering is now handled at file level via version_range field
+const MODELS_DIR = path.join(__dirname, "..", "models", "generated");
 
 /**
  * Load and parse a YAML file as VendorConfig
@@ -211,6 +210,21 @@ function validateVendorConfig(config: VendorConfig, fileName: string): string[] 
           if (cfg.decode !== null && cfg.decode !== undefined) {
             if (!isValidEngineConfig(cfg.decode)) {
               errors.push(`${cfgPrefix}: 'decode' must be a valid EngineConfig with tp >= 1`);
+            }
+          }
+
+          // Validate version_range if present
+          if (cfg.version_range !== undefined && cfg.version_range !== null) {
+            const vr = cfg.version_range as Record<string, unknown>;
+            if (typeof vr !== "object") {
+              errors.push(`${cfgPrefix}: 'version_range' must be an object`);
+            } else {
+              if (vr.min !== undefined && vr.min !== null && typeof vr.min !== "string") {
+                errors.push(`${cfgPrefix}: 'version_range.min' must be a string`);
+              }
+              if (vr.max !== undefined && vr.max !== null && typeof vr.max !== "string") {
+                errors.push(`${cfgPrefix}: 'version_range.max' must be a string or null`);
+              }
             }
           }
         }

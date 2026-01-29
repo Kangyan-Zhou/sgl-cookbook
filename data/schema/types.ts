@@ -5,7 +5,7 @@
  * It serves as the source of truth for the data structure.
  *
  * Hierarchy: Vendor -> Family -> Model -> Hardware -> Named Configuration
- * Note: Version is now a top-level folder (e.g., data/models/generated/v0.5.6/)
+ * Note: Version filtering is handled at file level via version_range field in source YAML
  */
 
 // ============ Level 1: Root (Vendor File) ============
@@ -95,7 +95,6 @@ export interface DiffusionAttributes {
 /**
  * Configuration for a specific hardware type (e.g., H100, H200, B200)
  * The key in the parent Record is the hardware name.
- * Version is now a top-level folder (e.g., data/models/generated/v0.5.6/)
  */
 export interface HardwareConfig {
   /** List of named configurations for this hardware */
@@ -122,6 +121,27 @@ export interface NamedConfiguration {
   prefill?: EngineConfig | null;
   /** Decode phase config (requires prefill, mutually exclusive with engine) */
   decode?: EngineConfig | null;
+  /** Version range this configuration is valid for */
+  version_range?: VersionRange;
+}
+
+/**
+ * Version range specifying min/max SGLang versions.
+ *
+ * Semantics:
+ * - Both absent: matches all versions
+ * - Only min: matches versions >= min
+ * - Only max: matches versions < max
+ * - Both present: matches versions in [min, max)
+ *
+ * Note: The file-level field is named `version_range` (singular range for entire file),
+ * while override fields at family/model/hardware/config level use `versions` in source YAML.
+ */
+export interface VersionRange {
+  /** Minimum version (inclusive), e.g., "0.5.6". Absent means no lower bound. */
+  min?: string;
+  /** Maximum version (exclusive), e.g., "0.5.8". Absent means no upper bound. */
+  max?: string;
 }
 
 /**

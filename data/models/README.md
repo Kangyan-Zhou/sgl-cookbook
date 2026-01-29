@@ -59,12 +59,19 @@ The pre-commit hook automatically runs the compiler when you modify `src/*.yaml`
 
 ```yaml
 # Required: Company/organization identifier
-company: company-name
+vendor: company-name
+
+# Optional: Version range for the entire file (inherited by all families/models)
+version_range:
+  min: "0.5.6"    # Minimum SGLang version (inclusive)
+  max: "0.5.9"    # Maximum SGLang version (exclusive), null for no upper limit
 
 # Optional: Default settings applied to all models from this company
 defaults:
-  hardware: [H100, H200, B200]    # Supported hardware types
-  versions: [v0.5.6]              # SGLang versions
+  hardware:
+    H100: { tp: 8 }    # Hardware-specific defaults
+    H200: { tp: 8 }
+    B200: { tp: 8 }
   configurations:                  # Deployment presets (see below)
     - name: default
       nodes: single
@@ -79,8 +86,29 @@ defaults:
 families:
   - name: FamilyName
     description: Optional description
+    # Optional: Override file-level version_range for this family
+    versions:
+      min: "0.5.7"    # Family only available from 0.5.7+
     # ... family config
 ```
+
+## Version Range Inheritance
+
+Version ranges follow an inheritance chain where more specific levels override parent levels:
+
+```
+File version_range (default for all items)
+    ↓
+Family versions (override file default)
+    ↓
+Model versions (override family)
+    ↓
+Hardware/Configuration versions (fine-grained overrides)
+```
+
+This means you only need to define the version range once at the file level. Child items (families, models, hardware, configurations) inherit automatically unless they specify their own `versions` field.
+
+**Note on field names:** The file-level field is named `version_range` (singular range for entire file), while override fields at nested levels (family/model/hardware/config) are named `versions`.
 
 ## Understanding Deployment Configurations
 
@@ -124,30 +152,28 @@ models:
   - name: DeepSeek-V3.2
     hardware:
       H200:
-        versions:
-          v0.5.6:
-            configurations:
-              - name: default
-                attributes:
-                  optimization: balanced
-                engine:
-                  tp: 8
-                  dp: null
+        configurations:
+          - name: default
+            attributes:
+              optimization: balanced
+            engine:
+              tp: 8
+              dp: null
 
-              - name: high-throughput-dp
-                attributes:
-                  optimization: high-throughput
-                engine:
-                  tp: 8
-                  dp: 8
-                  enable_dp_attention: true
+          - name: high-throughput-dp
+            attributes:
+              optimization: high-throughput
+            engine:
+              tp: 8
+              dp: 8
+              enable_dp_attention: true
 
-              - name: low-latency
-                attributes:
-                  optimization: low-latency
-                engine:
-                  tp: 8
-                  dp: null
+          - name: low-latency
+            attributes:
+              optimization: low-latency
+            engine:
+              tp: 8
+              dp: null
 ```
 
 This allows users to choose which deployment preset they want when launching any model from this company.
@@ -225,11 +251,16 @@ defaults.configurations (company-wide deployment presets)
 ### Example: Layered Overrides
 
 ```yaml
-company: example-ai
+vendor: example-ai
+
+version_range:
+  min: "0.5.6"
 
 defaults:
-  hardware: [H100, H200, B200]
-  versions: [v0.5.6]
+  hardware:
+    H100: { tp: 8 }
+    H200: { tp: 8 }
+    B200: { tp: 8 }
   configurations:
     # These presets apply to ALL models from example-ai
     - name: default
@@ -306,12 +337,22 @@ families:
 
 ## Configuration Reference
 
+### Version Range Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version_range` | object | **File-level only**: version scope inherited by all families/models |
+| `version_range.min` | string | Minimum SGLang version (inclusive), e.g., `"0.5.6"` |
+| `version_range.max` | string | Maximum SGLang version (exclusive), e.g., `"0.5.8"`. Omit for no upper limit |
+| `versions` | object | **Nested levels only**: override version range at family/model/hardware/config level |
+| `versions.min` | string | Minimum SGLang version (inclusive) for this item |
+| `versions.max` | string | Maximum SGLang version (exclusive) for this item |
+
 ### Defaults Section
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `hardware` | list | Hardware types: `H100`, `H200`, `B200` |
-| `versions` | list | SGLang versions (e.g., `v0.5.6`) |
+| `hardware` | dict | Hardware-specific defaults keyed by type (H100, H200, B200, MI325X, MI355X) |
 | `configurations` | list | Company-wide deployment presets |
 
 ### Deployment Configuration Fields
@@ -409,11 +450,16 @@ For detailed documentation on all SGLang server arguments, see:
 ### Example 1: Simple Dense Model (Llama-3.1)
 
 ```yaml
-company: meta-llama
+vendor: meta-llama
+
+version_range:
+  min: "0.5.6"
 
 defaults:
-  hardware: [H100, H200, B200]
-  versions: [v0.5.6]
+  hardware:
+    H100: { tp: 4 }
+    H200: { tp: 4 }
+    B200: { tp: 4 }
   configurations:
     - name: default
       nodes: single
@@ -437,11 +483,15 @@ families:
 ### Example 2: MoE Model with Multiple Deployment Presets (DeepSeek)
 
 ```yaml
-company: deepseek-ai
+vendor: deepseek-ai
+
+version_range:
+  min: "0.5.6"
 
 defaults:
-  hardware: [H200, B200]
-  versions: [v0.5.6]
+  hardware:
+    H200: { tp: 8 }
+    B200: { tp: 8 }
   configurations:
     # All DeepSeek models will have these two deployment options
     - name: default
@@ -473,11 +523,16 @@ families:
 ### Example 3: Variant Generation (Qwen3)
 
 ```yaml
-company: Qwen
+vendor: Qwen
+
+version_range:
+  min: "0.5.6"
 
 defaults:
-  hardware: [H100, H200, B200]
-  versions: [v0.5.6]
+  hardware:
+    H100: { tp: 8 }
+    H200: { tp: 8 }
+    B200: { tp: 8 }
   configurations:
     - name: default
       nodes: single
@@ -585,11 +640,16 @@ families:
 Override default deployment configurations for specific models that need different settings:
 
 ```yaml
-company: example-ai
+vendor: example-ai
+
+version_range:
+  min: "0.5.6"
 
 defaults:
-  hardware: [H100, H200, B200]
-  versions: [v0.5.6]
+  hardware:
+    H100: { tp: 8 }
+    H200: { tp: 8 }
+    B200: { tp: 8 }
   configurations:
     # Company-wide presets: all models get these options
     - name: default

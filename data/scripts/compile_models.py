@@ -6,6 +6,7 @@ Compiles simplified model configuration YAML files into the full schema format.
 
 Usage:
     python compile_models.py [--input-dir DIR] [--output-dir DIR] [--check]
+    python compile_models.py --version 0.5.8  # Generate for specific version
 
 The compiler reads simplified YAML files from the input directory and generates
 full schema-compliant YAML files in the output directory.
@@ -13,14 +14,205 @@ full schema-compliant YAML files in the output directory.
 Supports two patterns:
 1. Variant Generation: Define base_name + capabilities + quantizations
 2. Explicit Models: Define name directly (no variant expansion)
+
+Version Range Support:
+    Configurations can specify version ranges using the 'versions' field:
+
+    configurations:
+      - name: default
+        versions:
+          min: "0.5.6"   # Inclusive minimum version
+          max: null      # Exclusive maximum (null = no limit)
+        tp: 8
+      - name: speculative-mtp
+        versions:
+          min: "0.5.7"   # Only available from v0.5.7
+          max: "0.6.0"   # Removed in v0.6.0
+        tp: 8
+
+    When --version is specified, only configurations within range are included.
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+# =============================================================================
+# Version Handling
+# =============================================================================
+
+
+def parse_version(version_str: str) -> tuple[int, ...]:
+    """
+    Parse a version string into a tuple of integers for comparison.
+
+    Supports formats like: "0.5.6", "v0.5.6", "0.5.6-beta1"
+    Returns tuple like: (0, 5, 6)
+
+    Raises:
+        ValueError: If version_str is not a string or contains no numeric version parts
+    """
+    # Validate input type - common mistake is YAML like `min: 0.5.6` without quotes
+    # which parses as float 0.5 instead of string "0.5.6"
+    if not isinstance(version_str, str):
+        raise ValueError(
+            f"Version must be a string, got {type(version_str).__name__}: {version_str!r}. "
+            f"Hint: In YAML, version numbers must be quoted: \"0.5.6\""
+        )
+    # Remove 'v' prefix if present
+    version_str = version_str.lstrip("v")
+    # Extract numeric parts (ignore pre-release suffixes like -beta1)
+    match = re.match(r"^(\d+(?:\.\d+)*)", version_str)
+    if not match:
+        raise ValueError(f"Invalid version format: '{version_str}'. Expected format: '0.5.6' or 'v0.5.6'")
+    return tuple(int(x) for x in match.group(1).split("."))
+
+
+def version_in_range(
+    version: tuple[int, ...],
+    min_version: str | None,
+    max_version: str | None,
+) -> bool:
+    """
+    Check if a version is within the specified range.
+
+    Args:
+        version: Parsed version tuple (e.g., (0, 5, 8))
+        min_version: Minimum version string (inclusive), or None for no minimum
+        max_version: Maximum version string (exclusive), or None for no maximum
+
+    Returns:
+        True if version is within range [min_version, max_version)
+    """
+    if min_version is not None:
+        min_parsed = parse_version(min_version)
+        if version < min_parsed:
+            return False
+
+    if max_version is not None:
+        max_parsed = parse_version(max_version)
+        if version >= max_parsed:
+            return False
+
+    return True
+
+
+def item_in_version_range(
+    item: dict,
+    target_version: tuple[int, ...] | None,
+    item_type: str = "item",
+    inherited_range: dict | None = None,
+) -> bool:
+    """
+    Check if an item with optional 'versions' field is within target version range.
+
+    This is a unified helper used for filtering configurations, hardware, models,
+    and families by version. Supports inheritance: if item has no 'versions' field
+    or 'versions' is explicitly null, falls back to inherited_range. If both are
+    None/absent, the item is included (returns True).
+
+    Args:
+        item: Dict that may contain a 'versions' field with 'min'/'max' keys
+        target_version: Target version tuple, or None to include all
+        item_type: Description of item type for error messages (e.g., "configuration", "hardware")
+        inherited_range: Version range inherited from parent (file/family), used if item has no 'versions'
+
+    Returns:
+        True if item should be included for the target version
+
+    Raises:
+        ValueError: If the 'versions' field has invalid structure or unexpected keys
+    """
+    if target_version is None:
+        return True
+
+    # Get versions from item, or inherit from parent
+    versions = item.get("versions")
+    if versions is None:
+        versions = inherited_range
+    if versions is None:
+        return True
+
+    item_name = item.get("name", "<unnamed>")
+
+    # Validate versions field structure
+    if not isinstance(versions, dict):
+        raise ValueError(
+            f"Invalid 'versions' field in {item_type} '{item_name}': "
+            f"expected dict with 'min'/'max' keys, got {type(versions).__name__}. "
+            f"Example: versions: {{ min: \"0.5.6\", max: \"0.6.0\" }}"
+        )
+
+    # Check for typos/unexpected keys
+    valid_keys = {"min", "max"}
+    unexpected_keys = set(versions.keys()) - valid_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected keys in 'versions' field for {item_type} '{item_name}': {unexpected_keys}. "
+            f"Valid keys are: {valid_keys}"
+        )
+
+    min_ver = versions.get("min")
+    max_ver = versions.get("max")
+
+    # Add context to any version parsing errors
+    try:
+        return version_in_range(target_version, min_ver, max_ver)
+    except ValueError as e:
+        raise ValueError(f"{e} (in {item_type} '{item_name}')") from e
+
+
+def filter_by_version(
+    items: list[dict],
+    target_version: tuple[int, ...] | None,
+    item_type: str = "configuration",
+    verbose: bool = False,
+    inherited_range: dict | None = None,
+) -> list[dict]:
+    """
+    Filter a list of items by version range.
+
+    Items without a 'versions' field inherit from inherited_range if provided.
+    Items with 'versions' field are filtered based on their own min/max.
+
+    Args:
+        items: List of configuration dicts
+        target_version: Target version tuple, or None to include all
+        item_type: Description of item type for error/log messages
+        verbose: If True, log filtered items to stderr
+        inherited_range: Version range inherited from parent (file/family)
+
+    Returns:
+        Filtered list of items within version range
+
+    Raises:
+        ValueError: If an item has an invalid 'versions' field structure
+    """
+    if target_version is None:
+        return items
+
+    result = []
+    for item in items:
+        if item_in_version_range(item, target_version, item_type, inherited_range):
+            result.append(item)
+        elif verbose:
+            item_name = item.get("name", "<unnamed>")
+            # Use item's versions or inherited range for logging
+            versions = item.get("versions") or inherited_range or {}
+            min_ver = versions.get("min", "any")
+            max_ver = versions.get("max", "any")
+            version_str = ".".join(str(v) for v in target_version)
+            print(
+                f"  Filtered {item_type} '{item_name}': "
+                f"version {version_str} not in range [{min_ver}, {max_ver})",
+                file=sys.stderr,
+            )
+    return result
 
 
 # =============================================================================
@@ -150,6 +342,7 @@ def build_named_configuration(
     quant: str,
     quant_overrides: dict | None = None,
     speculative_draft_model: str | None = None,
+    effective_version_range: dict | None = None,
 ) -> dict:
     """
     Build a full named configuration block.
@@ -162,6 +355,8 @@ def build_named_configuration(
         speculative_draft_model: Path to speculative draft model. When provided and
             the config name contains "speculative", adds --speculative-draft-model-path
             to extra_args.
+        effective_version_range: The effective version range for this configuration
+            (from config's own 'versions' or inherited from parent)
 
     Returns:
         Full configuration block with attributes, engine config, etc.
@@ -178,7 +373,7 @@ def build_named_configuration(
             speculative_draft_model,
         ])
 
-    return {
+    result = {
         "name": config_template["name"],
         "attributes": {
             "nodes": config_template.get("nodes", "single"),
@@ -191,6 +386,15 @@ def build_named_configuration(
         "decode": None,
     }
 
+    # Add version_range if available, with quoted strings to prevent YAML float parsing
+    if effective_version_range:
+        result["version_range"] = {
+            "min": QuotedString(effective_version_range["min"]) if effective_version_range.get("min") else None,
+            "max": QuotedString(effective_version_range["max"]) if effective_version_range.get("max") else None,
+        }
+
+    return result
+
 
 def build_hardware_config(
     hw_name: str,
@@ -199,6 +403,9 @@ def build_hardware_config(
     quant: str,
     quant_overrides: dict | None = None,
     speculative_draft_model: str | None = None,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+    inherited_range: dict | None = None,
 ) -> dict:
     """
     Build hardware configuration with all named configurations.
@@ -210,16 +417,30 @@ def build_hardware_config(
         quant: Quantization type
         quant_overrides: Per-quantization overrides
         speculative_draft_model: Path to speculative draft model
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
+        inherited_range: Version range inherited from family
 
     Returns:
         Hardware configuration dict with list of named configurations
     """
-    # Version is now a top-level folder, so we directly return configurations
+    # Filter configurations by version range
+    all_configs = defaults.get("configurations", [])
+    filtered_configs = filter_by_version(
+        all_configs, target_version, item_type="configuration", verbose=verbose,
+        inherited_range=inherited_range
+    )
+
+    # Build configuration list with version ranges
     configurations = []
-    for config_template in defaults.get("configurations", []):
+    for config_template in filtered_configs:
+        # Determine the effective version range for this configuration
+        # Config's own 'versions' takes precedence over inherited range
+        effective_version_range = config_template.get("versions") or inherited_range
         configurations.append(
             build_named_configuration(
-                config_template, hw_config, quant, quant_overrides, speculative_draft_model
+                config_template, hw_config, quant, quant_overrides, speculative_draft_model,
+                effective_version_range=effective_version_range
             )
         )
     return {"configurations": configurations}
@@ -242,9 +463,20 @@ def get_merged_hardware_config(
     family: dict,
     model_def: dict,
     defaults: dict,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+    inherited_range: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """
     Merge hardware configs from file-level defaults, family, and model levels.
+
+    Args:
+        family: Family-level configuration
+        model_def: Model definition dict
+        defaults: File-level defaults
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
+        inherited_range: Version range inherited from family
 
     Returns (merged_hw_configs, hardware_list) where:
     - merged_hw_configs: dict with 'default' and hardware-specific overrides
@@ -325,6 +557,27 @@ def get_merged_hardware_config(
     else:
         # Use all hardware from file-level defaults
         hardware_list = default_hardware_list
+
+    # Filter hardware by version range using unified helper
+    if target_version is not None:
+        filtered_hardware_list = []
+        for hw_name in hardware_list:
+            hw_config = merged_hw_configs.get(hw_name, {})
+            # Create a temporary dict with 'name' for error messages
+            hw_item = {"name": hw_name, **hw_config}
+            if item_in_version_range(hw_item, target_version, item_type="hardware", inherited_range=inherited_range):
+                filtered_hardware_list.append(hw_name)
+            elif verbose:
+                versions = hw_config.get("versions") or inherited_range or {}
+                min_ver = versions.get("min", "any")
+                max_ver = versions.get("max", "any")
+                version_str = ".".join(str(v) for v in target_version)
+                print(
+                    f"  Filtered hardware '{hw_name}': "
+                    f"version {version_str} not in range [{min_ver}, {max_ver})",
+                    file=sys.stderr,
+                )
+        hardware_list = filtered_hardware_list
 
     return merged_hw_configs, hardware_list
 
@@ -443,6 +696,9 @@ def generate_model_variants(
     family: dict,
     model_def: dict,
     defaults: dict,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+    inherited_range: dict | None = None,
 ) -> list[dict]:
     """
     Generate model variants from a base model definition with capabilities/quantizations.
@@ -452,6 +708,9 @@ def generate_model_variants(
         family: Model family configuration
         model_def: Model definition with base_name, capabilities, quantizations, etc.
         defaults: File-level defaults including hardware and configurations
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
+        inherited_range: Version range inherited from family
 
     Returns:
         List of expanded model configurations
@@ -473,7 +732,11 @@ def generate_model_variants(
     speculative_draft_model = model_def.get("speculative_draft_model")
 
     # Get merged hardware config from family and model levels
-    hw_configs, hardware_list = get_merged_hardware_config(family, model_def, defaults)
+    hw_configs, hardware_list = get_merged_hardware_config(
+        family, model_def, defaults,
+        target_version=target_version, verbose=verbose,
+        inherited_range=inherited_range
+    )
     default_hw_config = hw_configs.get("default", {})
 
     models = []
@@ -516,7 +779,9 @@ def generate_model_variants(
 
                 hardware[hw_name] = build_hardware_config(
                     hw_name, hw_config, defaults, quant, quant_overrides,
-                    speculative_draft_model=speculative_draft_model
+                    speculative_draft_model=speculative_draft_model,
+                    target_version=target_version, verbose=verbose,
+                    inherited_range=inherited_range
                 )
 
             # Skip if no valid hardware
@@ -544,6 +809,9 @@ def build_explicit_model(
     family: dict,
     model_def: dict | str,
     defaults: dict,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+    inherited_range: dict | None = None,
 ) -> dict:
     """
     Build a single explicit model (no variant generation).
@@ -553,6 +821,9 @@ def build_explicit_model(
         family: Model family configuration
         model_def: Model definition dict or string (just the name)
         defaults: File-level defaults including hardware and configurations
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
+        inherited_range: Version range inherited from family
 
     Returns:
         Full model configuration dict
@@ -567,7 +838,11 @@ def build_explicit_model(
     model_path = model_def.get("model_path", f"{company}/{model_name}")
 
     # Get merged hardware config from family and model levels
-    hw_configs, hardware_list = get_merged_hardware_config(family, model_def, defaults)
+    hw_configs, hardware_list = get_merged_hardware_config(
+        family, model_def, defaults,
+        target_version=target_version, verbose=verbose,
+        inherited_range=inherited_range
+    )
     default_hw_config = hw_configs.get("default", {})
 
     # Default quantization for explicit models
@@ -587,7 +862,9 @@ def build_explicit_model(
         hw_config = {**default_hw_config, **hw_configs.get(hw_name, {})}
         hardware[hw_name] = build_hardware_config(
             hw_name, hw_config, defaults, quant, quant_overrides,
-            speculative_draft_model=speculative_draft_model
+            speculative_draft_model=speculative_draft_model,
+            target_version=target_version, verbose=verbose,
+            inherited_range=inherited_range
         )
 
     result = {
@@ -604,19 +881,61 @@ def build_explicit_model(
     return result
 
 
-def build_family(company: str, family: dict, defaults: dict) -> dict:
-    """Build a full family configuration."""
+def build_family(
+    company: str,
+    family: dict,
+    defaults: dict,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+    inherited_range: dict | None = None,
+) -> dict:
+    """
+    Build a full family configuration.
+
+    Args:
+        company: HuggingFace organization name
+        family: Family configuration dict
+        defaults: File-level defaults
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
+        inherited_range: Version range inherited from file (family's effective range)
+    """
     models = []
 
     for model_def in family.get("models", []):
+        # Skip models outside version range
+        # String-only model definitions have no version constraint, but inherit from family
+        if isinstance(model_def, dict):
+            if not item_in_version_range(model_def, target_version, item_type="model", inherited_range=inherited_range):
+                if verbose:
+                    model_name = model_def.get("name", model_def.get("base_name", "<unnamed>"))
+                    versions = model_def.get("versions") or inherited_range or {}
+                    min_ver = versions.get("min", "any")
+                    max_ver = versions.get("max", "any")
+                    version_str = ".".join(str(v) for v in target_version) if target_version else "none"
+                    print(
+                        f"  Filtered model '{model_name}': "
+                        f"version {version_str} not in range [{min_ver}, {max_ver})",
+                        file=sys.stderr,
+                    )
+                continue
+
         # Determine if this is variant generation or explicit model
         if isinstance(model_def, dict) and "base_name" in model_def:
             # Variant generation mode
-            variants = generate_model_variants(company, family, model_def, defaults)
+            variants = generate_model_variants(
+                company, family, model_def, defaults,
+                target_version=target_version, verbose=verbose,
+                inherited_range=inherited_range
+            )
             models.extend(variants)
         else:
             # Explicit model mode
-            models.append(build_explicit_model(company, family, model_def, defaults))
+            models.append(build_explicit_model(
+                company, family, model_def, defaults,
+                target_version=target_version, verbose=verbose,
+                inherited_range=inherited_range
+            ))
 
     return {
         "name": family["name"],
@@ -630,8 +949,21 @@ def build_family(company: str, family: dict, defaults: dict) -> dict:
 # =============================================================================
 
 
-def compile_config(source: dict, vendors: dict) -> dict:
-    """Compile a simplified config into full schema format."""
+def compile_config(
+    source: dict,
+    vendors: dict,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
+) -> dict:
+    """
+    Compile a simplified config into full schema format.
+
+    Args:
+        source: Source YAML configuration dict
+        vendors: Vendor lookup dict
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items to stderr
+    """
     # Support both 'vendor' (new) and 'company' (legacy) keys
     vendor_id = source.get("vendor") or source.get("company")
     if not vendor_id:
@@ -642,14 +974,92 @@ def compile_config(source: dict, vendors: dict) -> dict:
         company = vendors[vendor_id]["huggingface_org"]
     else:
         # Fallback: use vendor_id directly as company (for backwards compatibility)
-        print(f"  Warning: Vendor '{vendor_id}' not found in vendors.yaml, using as literal")
+        print(
+            f"  Warning: Vendor '{vendor_id}' not found in vendors.yaml. "
+            f"Using vendor ID as literal HuggingFace org. "
+            f"If this is unintentional, add '{vendor_id}' to vendors.yaml.",
+            file=sys.stderr,
+        )
         company = vendor_id
 
     defaults = source.get("defaults", {})
 
+    # Get file-level version_range - this is inherited by all families/models/configs
+    # that don't specify their own 'versions' field
+    file_version_range = source.get("version_range")
+    if file_version_range is not None:
+        if not isinstance(file_version_range, dict):
+            raise ValueError(
+                f"Invalid 'version_range' at file level: "
+                f"expected dict with 'min'/'max' keys, got {type(file_version_range).__name__}"
+            )
+        # Validate version_range keys and values eagerly
+        valid_keys = {"min", "max"}
+        unexpected_keys = set(file_version_range.keys()) - valid_keys
+        if unexpected_keys:
+            raise ValueError(
+                f"Unexpected keys in file-level 'version_range': {unexpected_keys}. "
+                f"Valid keys are: {valid_keys}"
+            )
+        # Validate version string formats
+        try:
+            if file_version_range.get("min") is not None:
+                parse_version(file_version_range["min"])
+            if file_version_range.get("max") is not None:
+                parse_version(file_version_range["max"])
+        except ValueError as e:
+            raise ValueError(f"Invalid version in file-level 'version_range': {e}") from e
+
     families = []
     for family in source.get("families", []):
-        families.append(build_family(company, family, defaults))
+        # Skip families outside version range using unified helper
+        # Families inherit file-level version_range if they don't have their own 'versions'
+        if not item_in_version_range(family, target_version, item_type="family", inherited_range=file_version_range):
+            if verbose:
+                family_name = family.get("name", "<unnamed>")
+                versions = family.get("versions") or file_version_range or {}
+                min_ver = versions.get("min", "any")
+                max_ver = versions.get("max", "any")
+                version_str = ".".join(str(v) for v in target_version) if target_version else "none"
+                print(
+                    f"  Filtered family '{family_name}': "
+                    f"version {version_str} not in range [{min_ver}, {max_ver})",
+                    file=sys.stderr,
+                )
+            continue
+
+        # Warn if family has redundant versions that match file-level version_range
+        family_versions = family.get("versions")
+        if family_versions is not None and file_version_range is not None:
+            if (family_versions.get("min") == file_version_range.get("min") and
+                family_versions.get("max") == file_version_range.get("max")):
+                family_name = family.get("name", "<unnamed>")
+                print(
+                    f"  Warning: Family '{family_name}' has redundant 'versions' "
+                    f"that matches file-level 'version_range' - consider removing it",
+                    file=sys.stderr,
+                )
+
+        # Determine the effective version range for this family (for passing to children)
+        family_version_range = family.get("versions") or file_version_range
+
+        built_family = build_family(
+            company, family, defaults,
+            target_version=target_version, verbose=verbose,
+            inherited_range=family_version_range
+        )
+        # Only include families that have at least one model
+        if built_family["models"]:
+            families.append(built_family)
+
+    # Warn if all families were filtered out (verbose mode)
+    if not families and target_version is not None and source.get("families"):
+        if verbose:
+            version_str = ".".join(str(v) for v in target_version)
+            print(
+                f"  Warning: All families filtered out for version {version_str}",
+                file=sys.stderr,
+            )
 
     return {
         "vendor": vendor_id,
@@ -658,36 +1068,96 @@ def compile_config(source: dict, vendors: dict) -> dict:
 
 
 def load_yaml(path: Path) -> dict:
-    """Load a YAML file."""
-    with open(path) as f:
-        return yaml.safe_load(f)
+    """
+    Load a YAML file.
+
+    Args:
+        path: Path to the YAML file
+
+    Returns:
+        Parsed YAML content as a dict
+
+    Raises:
+        ValueError: If file cannot be read, parsed, or is empty/invalid
+    """
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise ValueError(f"YAML file not found: {path}")
+    except PermissionError:
+        raise ValueError(f"Permission denied reading YAML file: {path}")
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML syntax in {path}: {e}")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"File encoding error in {path}: {e}")
+
+    if data is None:
+        raise ValueError(f"YAML file is empty or contains only null: {path}")
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"YAML file must contain a mapping/dict at root level, "
+            f"got {type(data).__name__}: {path}"
+        )
+    return data
+
+
+# Custom string class to force quoted output in YAML
+class QuotedString(str):
+    """String that will be quoted when serialized to YAML."""
+    pass
+
+
+def _represent_quoted_string(dumper: yaml.Dumper, data: QuotedString) -> yaml.Node:
+    """YAML representer for QuotedString - always uses quotes."""
+    return dumper.represent_scalar("tag:yaml.org,2002:str", str(data), style='"')
 
 
 def save_yaml(data: dict, path: Path) -> None:
-    """Save data to a YAML file with consistent formatting."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Save data to a YAML file with consistent formatting.
+
+    Args:
+        path: Output file path
+
+    Raises:
+        ValueError: If directory cannot be created or file cannot be written
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        raise ValueError(f"Cannot create output directory {path.parent}: {e}")
 
     # Custom representer to handle None values as 'null'
     def represent_none(dumper: yaml.Dumper, _: Any) -> yaml.Node:
         return dumper.represent_scalar("tag:yaml.org,2002:null", "null")
 
     yaml.add_representer(type(None), represent_none)
+    yaml.add_representer(QuotedString, _represent_quoted_string)
 
-    with open(path, "w") as f:
-        yaml.dump(
-            data,
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-            sort_keys=False,
-            width=120,
-        )
+    try:
+        with open(path, "w") as f:
+            yaml.dump(
+                data,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+                width=120,
+            )
+    except (PermissionError, OSError) as e:
+        raise ValueError(f"Cannot write output file {path}: {e}")
 
 
 def load_vendors(models_dir: Path) -> dict:
     """Load vendors from vendors.yaml file."""
     vendors_path = models_dir / "vendors.yaml"
     if not vendors_path.exists():
+        print(
+            f"Warning: {vendors_path} not found. "
+            f"Vendor resolution will use vendor IDs as literal HuggingFace orgs.",
+            file=sys.stderr,
+        )
         return {}
 
     data = load_yaml(vendors_path)
@@ -704,32 +1174,61 @@ def load_vendors(models_dir: Path) -> dict:
 
 
 def compile_file(
-    input_path: Path, output_path: Path, vendors: dict, check_only: bool = False
+    input_path: Path,
+    output_path: Path,
+    vendors: dict,
+    check_only: bool = False,
+    target_version: tuple[int, ...] | None = None,
+    verbose: bool = False,
 ) -> bool:
     """
     Compile a single file.
+
+    Args:
+        input_path: Source YAML file path
+        output_path: Destination YAML file path
+        vendors: Vendor lookup dict
+        check_only: If True, only check if output is up to date
+        target_version: Target version tuple for filtering, or None to include all
+        verbose: If True, log filtered items
 
     Returns True if successful (or if check passes), False otherwise.
     """
     print(f"Compiling {input_path.name}...")
 
-    source = load_yaml(input_path)
-    compiled = compile_config(source, vendors)
+    try:
+        source = load_yaml(input_path)
+        compiled = compile_config(source, vendors, target_version=target_version, verbose=verbose)
+    except ValueError as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"  ERROR: Unexpected error: {e}", file=sys.stderr)
+        return False
 
     if check_only:
-        if output_path.exists():
-            existing = load_yaml(output_path)
-            if existing == compiled:
-                print(f"  OK: {output_path.name} is up to date")
-                return True
+        try:
+            if output_path.exists():
+                existing = load_yaml(output_path)
+                if existing == compiled:
+                    print(f"  OK: {output_path.name} is up to date")
+                    return True
+                else:
+                    print(f"  FAIL: {output_path.name} is out of date")
+                    return False
             else:
-                print(f"  FAIL: {output_path.name} is out of date")
+                print(f"  FAIL: {output_path.name} does not exist")
                 return False
-        else:
-            print(f"  FAIL: {output_path.name} does not exist")
+        except ValueError as e:
+            print(f"  ERROR reading existing file: {e}", file=sys.stderr)
             return False
 
-    save_yaml(compiled, output_path)
+    try:
+        save_yaml(compiled, output_path)
+    except ValueError as e:
+        print(f"  ERROR writing file: {e}", file=sys.stderr)
+        return False
+
     print(f"  Wrote {output_path}")
     return True
 
@@ -756,12 +1255,35 @@ def main() -> int:
         help="Check if generated files are up to date without writing",
     )
     parser.add_argument(
+        "--version",
+        type=str,
+        default=None,
+        help="Target version to compile for (e.g., '0.5.8'). "
+             "Only configurations within version range will be included. "
+             "If not specified, all configurations are included.",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Show which configurations/hardware/models are filtered out by version",
+    )
+    parser.add_argument(
         "files",
         nargs="*",
         help="Specific files to compile (default: all .yaml files in input-dir)",
     )
 
     args = parser.parse_args()
+
+    # Parse target version for filtering
+    target_version = None
+    if args.version:
+        try:
+            target_version = parse_version(args.version)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        print(f"Compiling for version: {args.version}")
 
     # Load vendors from models directory (parent of input-dir)
     models_dir = args.input_dir.parent
@@ -785,7 +1307,10 @@ def main() -> int:
         # Preserve version subdirectory structure in output
         relative_path = input_path.relative_to(args.input_dir)
         output_path = args.output_dir / relative_path
-        if not compile_file(input_path, output_path, vendors, args.check):
+        if not compile_file(
+            input_path, output_path, vendors, args.check,
+            target_version=target_version, verbose=args.verbose
+        ):
             all_ok = False
 
     if args.check and not all_ok:
